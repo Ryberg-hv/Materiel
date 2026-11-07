@@ -3113,7 +3113,7 @@ function showLogin(mode){ const code=mode==='kod';
     m.style.color='#555'; m.textContent='Kontrollerar…'; $('#lgGo').disabled=true;
     try{ const h=await authHash(sp.key); const list=await authFetchList(sp.co); if(!list){ m.style.color='#b3261e'; m.textContent='Ingen uppkoppling, eller kompanikoden stämmer inte. Inloggning kräver internet.'; return; } const mine=list.keys.find(k=>k.h===h); if(!mine){ m.style.color='#b3261e'; m.textContent='Nyckeln finns inte på listan.'; return; }
       const ops=code?[{set:'uids/'+CL.uid,data:{signal:sig,t:Date.now(),invite:cd}},{del:'invites/'+cd}]:[{set:'claims/'+sigId(sig),data:{uid:CL.uid,t:Date.now()}},{set:'uids/'+CL.uid,data:{signal:sig,t:Date.now()}}];
-      try{ await FBA.batch(ops); }catch(e){ m.style.color='#b3261e'; m.textContent=code?'Koden är fel eller har gått ut, eller signalen finns inte i registret.':'Signalen finns inte i registret, eller är redan kopplad till en annan enhet. Be KVM släppa den, eller använd en kopplingskod.'; return; }
+      try{ await FBA.batch(ops); }catch(e){ m.style.color='#b3261e'; const ec=' [Felkod: '+((e&&(e.code||e.name))||'okänd')+(e&&e.message?' – '+String(e.message).slice(0,160):'')+']'; m.textContent=ec+' '+(code?'Koden är fel eller har gått ut, eller signalen finns inte i registret.':'Signalen finns inte i registret, eller är redan kopplad till en annan enhet. Be KVM släppa den, eller använd en kopplingskod.'); return; }
       lsSet('auth',{h,id:mine.id,lvl:mine.lvl,co:sp.co,lastOk:Date.now()}); lsSet('bind',{signal:sig,uid:CL.uid}); CL.sig=sig; SET.signal=sig; saveSet(); startSync();
     } finally { const b=$('#lgGo'); if(b) b.disabled=false; } }; }
 /* ---- start ---- */
@@ -3125,7 +3125,7 @@ async function startSync(){ gate('<h2 style="margin:0">Hämtar data…</h2><p cl
   startListeners(); }
 async function cloudUnbind(){ try{ await FBA.deleteDoc('uids/'+CL.uid); }catch(e){} lsDel('bind'); location.reload(); }
 async function cloudBoot(){ gate('<h2 style="margin:0">Startar…</h2>'); COMP={ver:3,namn:'Kompaniet',kvm:{signal:'',funk:'KVM'},extra:[],tilld:[],kmsg:[],korder:[],units:[]}; try{ const t=localStorage.getItem(LS_KEY+'_set'); if(t) SET=Object.assign(SET,JSON.parse(t)); }catch(e){} ensureComp();
-  try{ const r=await FBA.init(); CL.uid=r.uid; }catch(e){ gate('<h2>Kunde inte starta</h2><p>Appen når inte databasen. Kontrollera uppkopplingen och försök igen.</p><button class="btn primary" onclick="location.reload()">Försök igen</button>'); return; }
+  try{ const r=await FBA.init(); CL.uid=r.uid; }catch(e){ gate('<h2>Kunde inte starta</h2><p>Appen når inte databasen. Kontrollera uppkopplingen och försök igen.</p><p class="small mut">'+String((e&&(e.code||e.message))||e).replace(/</g,'&lt;')+'</p><button class="btn primary" onclick="location.reload()">Försök igen</button>'); return; }
   const bind=lsGet('bind'); let sig=bind&&bind.uid===CL.uid?bind.signal:'';
   if(!sig){ try{ const u=await FBA.getDoc('uids/'+CL.uid); if(u){ sig=u.signal; lsSet('bind',{signal:sig,uid:CL.uid}); } }catch(e){} }
   if(!sig){ showLogin(''); return; }

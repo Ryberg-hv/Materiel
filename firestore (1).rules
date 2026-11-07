@@ -1,0 +1,122 @@
+rules_version = '2';
+
+// Säkerhetsregler för Materiel (Firestore).
+//
+// Principer
+//  - Ingen personal-data. Identitet = anropssignal (dokument-id i versaler utan mellanslag, t.ex. RW41, CR1, EC1).
+//  - Anonym inloggning i Firebase. En webbläsare "tar" en signal en gång (claims + uids).
+//    Den som är först binder signalen. KVM kan släppa den (ta bort claim och uid), t.ex. vid ny telefon.
+//  - Behörighet läses ur /signaler/{signal}, aldrig ur vad användaren själv påstår.
+//      niva 'kvm'   = kompaniet (ser och ändrar allt)
+//      niva 'enhet' = Plut C / Stf Plut C / Tropp C (hela sin enhet)
+//      niva 'grupp' = Grp C, Stf Grp C, funktioner (läser sin enhet, bockar av, svarar)
+//
+// Datamodell som reglerna förutsätter (ett dokument per post):
+//  /signaler/{signal}                    { niva, unit, funk, grp }
+//  /claims/{signal}                      { uid, t }
+//  /uids/{uid}                           { signal, t, invite? }   (en per inloggad webbläsare)
+//  /invites/{kod}                        { sig, exp }             (kopplingskod för ny enhet)
+//  /kompani/{...}                        tilldelning, kompaniorder, meddelanden (bara KVM)
+//  /enheter/{unit}                       enhetens grunddata (namn, typ)
+//  /enheter/{unit}/{coll}/{id}           coll = arts, colli, rader, racks, kat, sess, ordrar, log
+
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function hasClaim() { return signedIn() && exists(/databases/$(db)/documents/uids/$(request.auth.uid)); }
+    function mySig()    { return get(/databases/$(db)/documents/uids/$(request.auth.uid)).data.signal; }
+    function me()       { return get(/databases/$(db)/documents/signaler/$(mySig())).data; }
+    function isKvm()    { return hasClaim() && me().niva == 'kvm'; }
+    function isChief(unit)  { return hasClaim() && me().niva == 'enhet' && me().unit == unit; }
+    function isMember(unit) { return hasClaim() && me().unit == unit; }
+
+    // Vem en webbläsare är. Skapas antingen tillsammans med claims (första enheten)
+    // eller med en kopplingskod (ytterligare enhet). KVM kan läsa och radera för att släppa en signal.
+    match /uids/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isKvm();
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['signal', 't', 'invite'])
+        && exists(/databases/$(db)/documents/signaler/$(request.resource.data.signal))
+        && (
+          (!('invite' in request.resource.data)
+            && getAfter(/databases/$(db)/documents/claims/$(request.resource.data.signal)).data.uid == uid)
+          ||
+          ('invite' in request.resource.data
+            && exists(/databases/$(db)/documents/invites/$(request.resource.data.invite))
+            && get(/databases/$(db)/documents/invites/$(request.resource.data.invite)).data.sig == request.resource.data.signal
+            && request.time < get(/databases/$(db)/documents/invites/$(request.resource.data.invite)).data.exp
+            && !existsAfter(/databases/$(db)/documents/invites/$(request.resource.data.invite)))
+        );
+      allow delete: if isKvm() || (signedIn() && request.auth.uid == uid);
+    }
+
+    // Kopplingskoder för ytterligare enheter. Gäller kort tid och raderas när de används.
+    match /invites/{code} {
+      allow create: if hasClaim()
+        && request.resource.data.keys().hasOnly(['sig', 'exp'])
+        && request.resource.data.sig == mySig()
+        && request.resource.data.exp <= request.time + duration.value(15, 'm');
+      allow delete: if signedIn();
+    }
+
+    // Första som tar en signal binder den. Ingen kan ändra, bara KVM kan släppa.
+    match /claims/{sig} {
+      allow read: if isKvm();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['uid', 't'])
+        && request.resource.data.uid == request.auth.uid
+        && exists(/databases/$(db)/documents/signaler/$(sig))
+        && getAfter(/databases/$(db)/documents/uids/$(request.auth.uid)).data.signal == sig;
+      allow delete: if isKvm();
+    }
+
+    // Signalregistret. KVM ändrar allt. Enhetschef lägger bara till och ändrar grupp-nivå i sin egen enhet.
+    match /signaler/{sig} {
+      allow read: if isKvm()
+        || (hasClaim() && sig == mySig())
+        || (hasClaim() && me().unit != '' && resource.data.unit == me().unit);
+      allow create, update: if isKvm()
+        || (isChief(request.resource.data.unit)
+            && request.resource.data.niva == 'grupp'
+            && (resource == null || resource.data.niva == 'grupp'));
+      allow delete: if isKvm()
+        || (isChief(resource.data.unit) && resource.data.niva == 'grupp');
+    }
+
+    // Kompaniets egna data (tilldelning, kompaniorder, meddelanden). Bara KVM.
+    match /kompani/{doc=**} {
+      allow read, write: if isKvm();
+    }
+
+    // Enheternas data. Egen enhet läser. Chef och KVM skriver.
+    match /enheter/{unit} {
+      allow read: if isKvm() || isMember(unit);
+      allow write: if isKvm();
+
+      match /{coll}/{id} {
+        function staff() { return isKvm() || isChief(unit); }
+        function mem()   { return isKvm() || isMember(unit); }
+
+        allow read: if mem();
+
+        // Packplan, artiklar, kollin, order m.m.: chef och KVM. Loggen får aldrig ändras i efterhand.
+        allow create, update, delete: if staff() && coll != 'log';
+
+        // Loggen är bara-tillägg för alla i enheten.
+        allow create: if mem() && coll == 'log';
+
+        // Inventering och återställning: alla i enheten.
+        allow create, update, delete: if mem() && coll == 'sess';
+
+        // Utlämning: grupp får bara ändra fältet "ute" på ett kolli.
+        allow update: if mem() && coll == 'colli'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ute']);
+
+        // Svar och läst-markering på order: grupp får bara ändra dessa fält.
+        allow update: if mem() && coll == 'ordrar'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['svar', 'lasta']);
+      }
+    }
+  }
+}
